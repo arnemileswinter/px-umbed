@@ -155,7 +155,7 @@ if __name__ == '__main__':
     latent_dim = 16
     model = PixelWisePatchPyramidVAE(latent_dim=latent_dim, patch_dim=patch_dim).to(device)
 
-    kl_weight = 0.0001
+    kl_weight = 0.001
     criterion = nn.MSELoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
