@@ -3,9 +3,51 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision import models
 from PIL import Image
 import os
 from pathlib import Path
+
+# Perceptual Loss using pretrained VGG features
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super(PerceptualLoss, self).__init__()
+        # Load pretrained VGG16 and extract feature layers
+        vgg = models.vgg16(pretrained=True).features
+        self.feature_extractor = nn.Sequential(*list(vgg.children())[:16]).eval()
+        
+        # Freeze parameters
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+    
+    def forward(self, inputs, targets):
+        # Handle multi-pyramid channel inputs (9 channels = 3 levels × 3 RGB)
+        # Process each pyramid level separately
+        num_channels = inputs.shape[1]
+        channels_per_level = 3
+        num_levels = num_channels // channels_per_level
+        
+        total_loss = 0
+        for i in range(num_levels):
+            start_ch = i * channels_per_level
+            end_ch = start_ch + channels_per_level
+            
+            input_level = inputs[:, start_ch:end_ch, :, :]
+            target_level = targets[:, start_ch:end_ch, :, :]
+
+            # Upsample to minimum VGG input size if needed (8x8 -> 32x32)
+            if input_level.shape[2] < 32 or input_level.shape[3] < 32:
+                input_level = F.interpolate(input_level, size=(32, 32), mode='bilinear', align_corners=False)
+                target_level = F.interpolate(target_level, size=(32, 32), mode='bilinear', align_corners=False)
+            
+            # Extract features
+            input_features = self.feature_extractor(input_level)
+            target_features = self.feature_extractor(target_level)
+            
+            # Compute MSE in feature space
+            total_loss += F.mse_loss(input_features, target_features)
+        
+        return total_loss / num_levels
 
 # Custom dataset for unlabeled images
 class ImageDataset(Dataset):
@@ -26,22 +68,29 @@ class ImageDataset(Dataset):
             image = self.transform(image)
         return image
     
-class PatchWiseVAE(nn.Module):
+class PixelWisePatchPyramidVAE(nn.Module):
     def __init__(self, in_channels=3, latent_dim=8, out_channels=9, patch_dim=8):
-        super(PatchWiseVAE, self).__init__()
+        super(PixelWisePatchPyramidVAE, self).__init__()
         self.patch_dim = patch_dim
         self.out_channels = out_channels
         self.latent_dim = latent_dim
         
-        self.unet_conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
-        self.unet_conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.unet_conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.unet_conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.unet_deconv1 = nn.ConvTranspose2d(512, 256, kernel_size=3, padding=1)
-        self.unet_deconv2 = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
-        self.unet_deconv3 = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
+        # Encoder with strided convolutions for downsampling
+        self.unet_conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+        self.unet_conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)  # 512 -> 256
+        self.unet_conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)  # 256 -> 128
+        self.unet_conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)  # 128 -> 64
 
-        self.patch_head = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
+        self.unet_bottleneck = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        
+        # Decoder with strided transposed convolutions for upsampling
+        self.unet_deconv1 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)  # 64 -> 128
+        self.unet_deconv2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)  # 128 -> 256
+        self.unet_deconv3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)  # 256 -> 512
+
+        # VAE: separate heads for mean and log variance
+        self.patch_head_mu = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
+        self.patch_head_logvar = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
         
         # Reconstruct patches: decode each pixel's latent vector into an 8x8 patch
         # This is an MLP that works on individual latent vectors
@@ -61,35 +110,29 @@ class PatchWiseVAE(nn.Module):
     def forward(self, x, batch_indices):
         batch_size, _, height, width = x.shape
         
-        # Encoder
-        x1 = self.unet_conv1(x)
-        x = F.relu(x1)
-        x2 = self.unet_conv2(x)
-        x = F.relu(x2)
-        x3 = self.unet_conv3(x)
-        x = F.relu(x3)
-        x4 = self.unet_conv4(x)
-        x = F.relu(x4)
-
-        # skip connections  to deconvs
-        x = self.unet_deconv1(x + x4)
-        x = F.relu(x)
-        x = self.unet_deconv2(x + x3)
-        x = F.relu(x)
-        x = self.unet_deconv3(x + x2)
-        x = F.relu(x + x1)
+        # Encoder with skip connections
+        x1 = F.relu(self.unet_conv1(x))  # [B, 64, 512, 512]
+        x2 = F.relu(self.unet_conv2(x1))  # [B, 128, 256, 256]
+        x3 = F.relu(self.unet_conv3(x2))  # [B, 256, 128, 128]
+        x4 = F.relu(self.unet_conv4(x3))  # [B, 512, 64, 64]
+        x = F.relu(self.unet_bottleneck(x4))  # Bottleneck
+        # Decoder with skip connections
+        x = F.relu(self.unet_deconv1(x) + x3)  # [B, 256, 128, 128]
+        x = F.relu(self.unet_deconv2(x) + x2)  # [B, 128, 256, 256]
+        x = F.relu(self.unet_deconv3(x) + x1)  # [B, 64, 512, 512]
 
         x = self.patch_head(x)
 
         # Reshape from [batch, latent_dim, height, width] to [batch*height*width, latent_dim]
         x = x.permute(0, 2, 3, 1).contiguous()  # [batch, height, width, latent_dim]
         x = x.view(batch_size * height * width, self.latent_dim)[batch_indices]  # [num_selected, latent_dim]
+        # We now have the per-pixel latent bottleneck!
 
-        # We now have a per-pixel bottle neck!
-        
+        # todo: we need KL divergence??
+
+        # per pixel pyramid decoder:
         # Decode each latent vector into a patch
-        x = self.reconstruction_head(x)  # [num_selected, patch_dim*patch_dim]A
-        
+        x = self.reconstruction_head(x)  # [num_selected, patch_dim*patch_dim]
         # Reshape to [num_selected, 1, patch_dim, patch_dim]
         num_selected = x.shape[0]
         x = x.view(num_selected, 1, self.patch_dim, self.patch_dim)
@@ -97,7 +140,6 @@ class PatchWiseVAE(nn.Module):
         x = F.relu(self.channel_head_1(x))  # [batch*height*width, 32, patch_dim, patch_dim]
         x = F.relu(self.channel_head_2(x))  # [batch*height*width, 64, patch_dim, patch_dim]
         x = F.tanh(self.channel_head_3(x))  # [batch*height*width, out_channels, patch_dim, patch_dim]
-        print("after reconstruction head:", x.shape)
         
         return x
 
@@ -122,18 +164,18 @@ if __name__ == '__main__':
         image_dataset,
         batch_size=4,
         shuffle=True,
-        num_workers=0  # Can use multiple workers now with if __name__ == '__main__'
+        num_workers=0
     )
 
     patch_dim = 8
     pyramid_levels = 3
-    latent_dim = 64
-    model = PatchWiseVAE(latent_dim=latent_dim, patch_dim=patch_dim).to(device)
+    latent_dim = 16
+    model = PixelWisePatchPyramidVAE(latent_dim=latent_dim, patch_dim=patch_dim).to(device)
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = PerceptualLoss().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
-    patch_batch_size = 512
+    patch_batch_size = 128
 
     for images in dataloader:
         images = images.to(device)
@@ -236,7 +278,6 @@ if __name__ == '__main__':
             # Get model outputs and select the same indices
             outputs = model(images, batch_indices)
             
-            print("training with patch batch:", outputs.shape)
             optimizer.zero_grad()
             loss = criterion(outputs, patch_batch)
             loss.backward()
@@ -244,38 +285,39 @@ if __name__ == '__main__':
             print(f'Patch-Batch {batch}, Loss: {loss.item()}')
 
             # debug visualize the patch batch inputs and outputs
-            all_comparisons = []
-            
-            for i in range(patch_batch_size):
-                input_patch = patch_batch[i].detach().cpu()
-                output_patch = outputs[i].detach().cpu()
+            if (batch+1) % 100 == 0:
+                all_comparisons = []
                 
-                # Create a 2-column layout: inputs on left, outputs on right
-                # Stack pyramid levels vertically
-                input_levels = []
-                output_levels = []
+                for i in range(patch_batch_size):
+                    input_patch = patch_batch[i].detach().cpu()
+                    output_patch = outputs[i].detach().cpu()
+                    
+                    # Create a 2-column layout: inputs on left, outputs on right
+                    # Stack pyramid levels vertically
+                    input_levels = []
+                    output_levels = []
+                    
+                    for l in range(pyramid_levels):
+                        # Visualize each level of the pyramid
+                        start_channel = l * 3
+                        end_channel = start_channel + 3
+                        input_level = input_patch[start_channel:end_channel, :, :]
+                        output_level = output_patch[start_channel:end_channel, :, :]
+                        input_levels.append(input_level)
+                        output_levels.append(output_level)
+                    
+                    # Stack levels vertically (along height dimension)
+                    input_column = torch.cat(input_levels, dim=1)  # [3, height*pyramid_levels, width]
+                    output_column = torch.cat(output_levels, dim=1)  # [3, height*pyramid_levels, width]
+                    
+                    # Concatenate horizontally to create 2-column layout
+                    comparison = torch.cat([input_column, output_column], dim=2)  # [3, height*pyramid_levels, width*2]
+                    all_comparisons.append(comparison)
                 
-                for l in range(pyramid_levels):
-                    # Visualize each level of the pyramid
-                    start_channel = l * 3
-                    end_channel = start_channel + 3
-                    input_level = input_patch[start_channel:end_channel, :, :]
-                    output_level = output_patch[start_channel:end_channel, :, :]
-                    input_levels.append(input_level)
-                    output_levels.append(output_level)
+                # Stack all patch comparisons vertically into one large image
+                final_image = torch.cat(all_comparisons, dim=1)  # [3, height*pyramid_levels*batch_size, width*2]
                 
-                # Stack levels vertically (along height dimension)
-                input_column = torch.cat(input_levels, dim=1)  # [3, height*pyramid_levels, width]
-                output_column = torch.cat(output_levels, dim=1)  # [3, height*pyramid_levels, width]
-                
-                # Concatenate horizontally to create 2-column layout
-                comparison = torch.cat([input_column, output_column], dim=2)  # [3, height*pyramid_levels, width*2]
-                all_comparisons.append(comparison)
-            
-            # Stack all patch comparisons vertically into one large image
-            final_image = torch.cat(all_comparisons, dim=1)  # [3, height*pyramid_levels*batch_size, width*2]
-            
-            # Save the combined image
-            transforms.ToPILImage()(final_image).save(f'debug/batch_{batch}_all_patches.png')
+                # Save the combined image
+                transforms.ToPILImage()(final_image).save(f'debug/batch_{batch}_all_patches.png')
 
         print('Patches shape:', patches.shape)
