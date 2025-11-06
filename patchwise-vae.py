@@ -3,51 +3,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision import models
 from PIL import Image
 import os
 from pathlib import Path
-
-# Perceptual Loss using pretrained VGG features
-class PerceptualLoss(nn.Module):
-    def __init__(self):
-        super(PerceptualLoss, self).__init__()
-        # Load pretrained VGG16 and extract feature layers
-        vgg = models.vgg16(pretrained=True).features
-        self.feature_extractor = nn.Sequential(*list(vgg.children())[:16]).eval()
-        
-        # Freeze parameters
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-    
-    def forward(self, inputs, targets):
-        # Handle multi-pyramid channel inputs (9 channels = 3 levels × 3 RGB)
-        # Process each pyramid level separately
-        num_channels = inputs.shape[1]
-        channels_per_level = 3
-        num_levels = num_channels // channels_per_level
-        
-        total_loss = 0
-        for i in range(num_levels):
-            start_ch = i * channels_per_level
-            end_ch = start_ch + channels_per_level
-            
-            input_level = inputs[:, start_ch:end_ch, :, :]
-            target_level = targets[:, start_ch:end_ch, :, :]
-
-            # Upsample to minimum VGG input size if needed (8x8 -> 32x32)
-            if input_level.shape[2] < 32 or input_level.shape[3] < 32:
-                input_level = F.interpolate(input_level, size=(32, 32), mode='bilinear', align_corners=False)
-                target_level = F.interpolate(target_level, size=(32, 32), mode='bilinear', align_corners=False)
-            
-            # Extract features
-            input_features = self.feature_extractor(input_level)
-            target_features = self.feature_extractor(target_level)
-            
-            # Compute MSE in feature space
-            total_loss += F.mse_loss(input_features, target_features)
-        
-        return total_loss / num_levels
 
 # Custom dataset for unlabeled images
 class ImageDataset(Dataset):
@@ -76,21 +34,27 @@ class PixelWisePatchPyramidVAE(nn.Module):
         self.latent_dim = latent_dim
         
         # Encoder with strided convolutions for downsampling
-        self.unet_conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
-        self.unet_conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)  # 512 -> 256
-        self.unet_conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)  # 256 -> 128
-        self.unet_conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)  # 128 -> 64
+        self.unet_conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1)
+        self.unet_conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)  # 512 -> 256
+        self.unet_conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)  # 256 -> 128
+        self.unet_conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)  # 128 -> 64
 
-        self.unet_bottleneck = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        self.unet_bottleneck = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
         
         # Decoder with strided transposed convolutions for upsampling
-        self.unet_deconv1 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)  # 64 -> 128
-        self.unet_deconv2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)  # 128 -> 256
-        self.unet_deconv3 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)  # 256 -> 512
+        # UNet: upsample first, then concatenate with skip, then process
+        self.unet_deconv1 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)  # 64 -> 128
+        self.unet_conv5 = nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1)  # cat(256, 256) -> 256
+        
+        self.unet_deconv2 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)  # 128 -> 256
+        self.unet_conv6 = nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1)  # cat(128, 128) -> 128
+        
+        self.unet_deconv3 = nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1)  # 256 -> 512
+        self.unet_conv7 = nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1)  # cat(64, 64) -> 64
 
         # VAE: separate heads for mean and log variance
-        self.patch_head_mu = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
-        self.patch_head_logvar = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
+        self.patch_head_mu = nn.Conv2d(16, latent_dim, kernel_size=3, padding=1)
+        self.patch_head_logvar = nn.Conv2d(16, latent_dim, kernel_size=3, padding=1)
         
         # Reconstruct patches: decode each pixel's latent vector into an 8x8 patch
         # This is an MLP that works on individual latent vectors
@@ -103,45 +67,65 @@ class PixelWisePatchPyramidVAE(nn.Module):
         )
         
         # Add channel features with 1x1 conv
-        self.channel_head_1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.channel_head_2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.channel_head_3 = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
+        self.channel_head_1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.channel_head_2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.channel_head_3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.channel_head_4 = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x, batch_indices):
         batch_size, _, height, width = x.shape
         
         # Encoder with skip connections
-        x1 = F.relu(self.unet_conv1(x))  # [B, 64, 512, 512]
-        x2 = F.relu(self.unet_conv2(x1))  # [B, 128, 256, 256]
-        x3 = F.relu(self.unet_conv3(x2))  # [B, 256, 128, 128]
-        x4 = F.relu(self.unet_conv4(x3))  # [B, 512, 64, 64]
-        x = F.relu(self.unet_bottleneck(x4))  # Bottleneck
-        # Decoder with skip connections
-        x = F.relu(self.unet_deconv1(x) + x3)  # [B, 256, 128, 128]
-        x = F.relu(self.unet_deconv2(x) + x2)  # [B, 128, 256, 256]
-        x = F.relu(self.unet_deconv3(x) + x1)  # [B, 64, 512, 512]
+        x1 = F.relu(self.unet_conv1(x))
+        x2 = F.relu(self.unet_conv2(x1))
+        x3 = F.relu(self.unet_conv3(x2))
+        x4 = F.relu(self.unet_conv4(x3))
+        x = F.relu(self.unet_bottleneck(x4))
+        
+        # Decoder with UNet-style concatenation: upsample -> concat -> process
+        x = self.unet_deconv1(x)
+        x = F.relu(self.unet_conv5(torch.cat([x, x3], dim=1)))
+        
+        x = self.unet_deconv2(x)
+        x = F.relu(self.unet_conv6(torch.cat([x, x2], dim=1)))
+        
+        x = self.unet_deconv3(x)
+        x = F.relu(self.unet_conv7(torch.cat([x, x1], dim=1)))
 
-        x = self.patch_head(x)
+        # VAE: compute mean and log variance
+        mu = self.patch_head_mu(x)
+        logvar = self.patch_head_logvar(x)
 
         # Reshape from [batch, latent_dim, height, width] to [batch*height*width, latent_dim]
-        x = x.permute(0, 2, 3, 1).contiguous()  # [batch, height, width, latent_dim]
-        x = x.view(batch_size * height * width, self.latent_dim)[batch_indices]  # [num_selected, latent_dim]
-        # We now have the per-pixel latent bottleneck!
-
-        # todo: we need KL divergence??
+        mu = mu.permute(0, 2, 3, 1).contiguous().view(batch_size * height * width, self.latent_dim)
+        logvar = logvar.permute(0, 2, 3, 1).contiguous().view(batch_size * height * width, self.latent_dim)
+        
+        # Select only the patches we need
+        mu_selected = mu[batch_indices]
+        logvar_selected = logvar[batch_indices]
+        
+        # Reparameterization trick: sample z = mu + std * epsilon
+        std = torch.exp(0.5 * logvar_selected)
+        eps = torch.randn_like(std)
+        z = mu_selected + eps * std
+        
+        # We now have the per-pixel latent bottleneck with sampled z!
+        # Compute KL divergence for selected patches
+        kl_div = -0.5 * torch.sum(1 + logvar_selected - mu_selected.pow(2) - logvar_selected.exp(), dim=1).mean()
 
         # per pixel pyramid decoder:
         # Decode each latent vector into a patch
-        x = self.reconstruction_head(x)  # [num_selected, patch_dim*patch_dim]
+        x = self.reconstruction_head(z)  # [num_selected, patch_dim*patch_dim]
         # Reshape to [num_selected, 1, patch_dim, patch_dim]
-        num_selected = x.shape[0]
+        num_selected = z.shape[0]
         x = x.view(num_selected, 1, self.patch_dim, self.patch_dim)
         # Add channel features
         x = F.relu(self.channel_head_1(x))  # [batch*height*width, 32, patch_dim, patch_dim]
         x = F.relu(self.channel_head_2(x))  # [batch*height*width, 64, patch_dim, patch_dim]
-        x = F.tanh(self.channel_head_3(x))  # [batch*height*width, out_channels, patch_dim, patch_dim]
+        x = F.relu(self.channel_head_3(x))  # [batch*height*width, 64, patch_dim, patch_dim]
+        x = torch.sigmoid(self.channel_head_4(x))  # [batch*height*width, out_channels, patch_dim, patch_dim] -> [0, 1]
         
-        return x
+        return x, kl_div
 
 # DataLoader for 512x512 images
 transform = transforms.Compose([
@@ -172,10 +156,10 @@ if __name__ == '__main__':
     latent_dim = 16
     model = PixelWisePatchPyramidVAE(latent_dim=latent_dim, patch_dim=patch_dim).to(device)
 
-    criterion = PerceptualLoss().to(device)
+    criterion = nn.MSELoss().to(device)  # Use MSE for overfitting test - simpler signal
     optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
-    patch_batch_size = 128
+    patch_batch_size = 64
 
     for images in dataloader:
         images = images.to(device)
@@ -221,68 +205,75 @@ if __name__ == '__main__':
         print("Number of patches:", patches.shape[0])
         print("Number of patch batches:", patches.shape[0] // patch_batch_size)
         
-        # Shuffle patch indices for randomized training
+        # Static indices for intentional overfitting (no randomization)
         indices = torch.randperm(patches.shape[0])
         
         for batch in range(patches.shape[0] // patch_batch_size):
             # Use shuffled indices to grab random patches
+            #batch_indices = indices[:patch_batch_size]  # intentnionally re-use same indices for overfitting to check outputs 
             batch_indices = indices[batch * patch_batch_size:(batch + 1) * patch_batch_size]
             patch_batch = patches[batch_indices]  # grab random per-pixel pyramid-patches
             
+            # AUGMENTATIONS
             # Apply consistent augmentations across all pyramid levels for each patch
-            augmented_patches = []
-            for i in range(patch_batch.shape[0]):
-                # Randomly decide augmentation parameters for this patch
-                do_hflip = torch.rand(1).item() > 0.5
-                do_vflip = torch.rand(1).item() > 0.5
-                rotation_k = torch.randint(0, 4, (1,)).item()  # 0=no rotation, 1=90°, 2=180°, 3=270°
-                hue_factor = (torch.rand(1).item() - 0.5) * 0.6  # range [-0.3, 0.3]
-                
-                # Apply the same transformations to all pyramid levels
-                levels = []
-                for l in range(pyramid_levels):
-                    start_channel = l * 3
-                    end_channel = start_channel + 3
-                    level = patch_batch[i, start_channel:end_channel, :, :]
-                    
-                    # Apply transformations
-                    if do_hflip:
-                        level = torch.flip(level, [2])  # flip width
-                    if do_vflip:
-                        level = torch.flip(level, [1])  # flip height
-                    if rotation_k > 0:
-                        level = torch.rot90(level, k=rotation_k, dims=[1, 2])
-                    
-                    # Apply hue shift in GPU using RGB to HSV conversion
-                    if hue_factor != 0:
-                        # Simple RGB-based hue shift approximation (stays on GPU)
-                        # Shift color channels cyclically
-                        r, g, b = level[0], level[1], level[2]
-                        shift_amount = hue_factor * 2  # scale to [-0.6, 0.6]
-                        
-                        # Apply color shift
-                        level = torch.stack([
-                            torch.clamp(r + shift_amount * (g - b), 0, 1),
-                            torch.clamp(g + shift_amount * (b - r), 0, 1),
-                            torch.clamp(b + shift_amount * (r - g), 0, 1)
-                        ], dim=0)
-                    
-                    levels.append(level)
-                
-                # Concatenate all levels back together
-                aug_patch = torch.cat(levels, dim=0)
-                augmented_patches.append(aug_patch)
+            # augmented_patches = []
+            # for i in range(patch_batch.shape[0]):
+            #     # Randomly decide augmentation parameters for this patch
+            #     do_hflip = torch.rand(1).item() > 0.5
+            #     do_vflip = torch.rand(1).item() > 0.5
+            #     rotation_k = torch.randint(0, 4, (1,)).item()  # 0=no rotation, 1=90°, 2=180°, 3=270°
+            #     hue_factor = (torch.rand(1).item() - 0.5) * 0.6  # range [-0.3, 0.3]
+            #     
+            #     # Apply the same transformations to all pyramid levels
+            #     levels = []
+            #     for l in range(pyramid_levels):
+            #         start_channel = l * 3
+            #         end_channel = start_channel + 3
+            #         level = patch_batch[i, start_channel:end_channel, :, :]
+            #         
+            #         # Apply transformations
+            #         if do_hflip:
+            #             level = torch.flip(level, [2])  # flip width
+            #         if do_vflip:
+            #             level = torch.flip(level, [1])  # flip height
+            #         if rotation_k > 0:
+            #             level = torch.rot90(level, k=rotation_k, dims=[1, 2])
+            #         
+            #         # Apply hue shift in GPU using RGB to HSV conversion
+            #         if hue_factor != 0:
+            #             # Simple RGB-based hue shift approximation (stays on GPU)
+            #             # Shift color channels cyclically
+            #             r, g, b = level[0], level[1], level[2]
+            #             shift_amount = hue_factor * 2  # scale to [-0.6, 0.6]
+            #             
+            #             # Apply color shift
+            #             level = torch.stack([
+            #                 torch.clamp(r + shift_amount * (g - b), 0, 1),
+            #                 torch.clamp(g + shift_amount * (b - r), 0, 1),
+            #                 torch.clamp(b + shift_amount * (r - g), 0, 1)
+            #             ], dim=0)
+            #         
+            #         levels.append(level)
+            #     
+            #     # Concatenate all levels back together
+            #     aug_patch = torch.cat(levels, dim=0)
+            #     augmented_patches.append(aug_patch)
+            # 
+            # patch_batch = torch.stack(augmented_patches)
             
-            patch_batch = torch.stack(augmented_patches)
-            
-            # Get model outputs and select the same indices
-            outputs = model(images, batch_indices)
+            # Get model outputs and KL divergence
+            # model is fed entire image, batch_indices will be the entirety of its pixel indices in inference.
+            # currently we clip to only the pixel indices for patches we want to train on.
+            outputs, kl_div = model(images, batch_indices)
             
             optimizer.zero_grad()
-            loss = criterion(outputs, patch_batch)
+            # Total loss = reconstruction loss + KL divergence
+            recon_loss = criterion(outputs, patch_batch)
+            kl_weight = 0.0001  # Reduce KL weight for overfitting test - let it memorize!
+            loss = recon_loss + kl_weight * kl_div
             loss.backward()
             optimizer.step()
-            print(f'Patch-Batch {batch}, Loss: {loss.item()}')
+            print(f'Patch-Batch {batch}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_div.item():.4f}')
 
             # debug visualize the patch batch inputs and outputs
             if (batch+1) % 100 == 0:
