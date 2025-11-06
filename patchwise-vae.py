@@ -179,8 +179,8 @@ if __name__ == '__main__':
         # Permute to get [batch, 512, 512, channels, patch_h, patch_w]
         patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
         # Reshape to [batch*512*512, channels, patch_h, patch_w]
-        patch_batch, height, width, channels, patch_h, patch_w = patches.shape
-        patches = patches.view(patch_batch * height * width, channels, patch_h, patch_w)
+        patch_batch_idx, height, width, channels, patch_h, patch_w = patches.shape
+        patches = patches.view(patch_batch_idx * height * width, channels, patch_h, patch_w)
 
         for level in range(1, pyramid_levels):
             # create pyramid of patches - extract another sliding window of patch_dim * 2, pixel-wise,
@@ -209,9 +209,9 @@ if __name__ == '__main__':
         # Static indices for intentional overfitting (no randomization)
         indices = torch.randperm(patches.shape[0])
         
-        for patch_batch in range(patches.shape[0] // patch_batch_size):
+        for patch_batch_idx in range(patches.shape[0] // patch_batch_size):
             # Use shuffled indices to grab random patches
-            batch_indices = indices[patch_batch * patch_batch_size:(patch_batch + 1) * patch_batch_size]
+            batch_indices = indices[patch_batch_idx * patch_batch_size:(patch_batch_idx + 1) * patch_batch_size]
             patch_batch = patches[batch_indices] # grab random per-pixel pyramid-patches
             
             # Get model outputs and KL divergence
@@ -228,10 +228,10 @@ if __name__ == '__main__':
             loss = recon_loss + kl_weight * kl_div
             loss.backward()
             optimizer.step()
-            print(f'Patch-Batch {patch_batch}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_div.item():.4f}')
+            print(f'Patch-Batch {patch_batch_idx}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_div.item():.4f}')
 
             # debug visualize the patch batch inputs and outputs
-            if (patch_batch+1) % 100 == 0:
+            if (patch_batch_idx+1) % 100 == 0:
                 all_comparisons = []
                 
                 for i in range(patch_batch_size):
@@ -264,6 +264,6 @@ if __name__ == '__main__':
                 final_image = torch.cat(all_comparisons, dim=1)
                 
                 # Save the combined image
-                transforms.ToPILImage()(final_image).save(f'debug/batch_{patch_batch}_all_patches.png')
+                transforms.ToPILImage()(final_image).save(f'debug/batch_{patch_batch_idx}_all_patches.png')
 
         print('Patches shape:', patches.shape)
