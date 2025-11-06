@@ -4,7 +4,6 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
-import os
 from pathlib import Path
 
 # Custom dataset for unlabeled images
@@ -156,114 +155,132 @@ if __name__ == '__main__':
     latent_dim = 16
     model = PixelWisePatchPyramidVAE(latent_dim=latent_dim, patch_dim=patch_dim).to(device)
 
+    kl_weight = 0.0001
     criterion = nn.MSELoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
 
+    epochs = 5
+
     patch_batch_size = 64
 
-    for images in dataloader:
-        images = images.to(device)
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        epoch_recon_loss = 0.0
+        epoch_kl_loss = 0.0
+        num_batches = 0
         
-        # Pad images for patch extraction
-        pad_size = patch_dim // 2
-        padded_images = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
-        # Pad images with zeros
-        current_patch_dim = patch_dim
-        pad_size = patch_dim // 2
-        padded = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
-        # Extract patch around each pixel using unfold with stride=1
-        # unfold gives us 513x513 patches from 520x520, but we only want 512x512
-        patches = padded.unfold(2, patch_dim, 1).unfold(3, patch_dim, 1)
-        # Crop to keep only patches for the original 512x512 pixels
-        patches = patches[:, :, :512, :512, :, :]  # [batch, channels, 512, 512, patch_h, patch_w]
-        # Permute to get [batch, 512, 512, channels, patch_h, patch_w]
-        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
-        # Reshape to [batch*512*512, channels, patch_h, patch_w]
-        patch_batch_idx, height, width, channels, patch_h, patch_w = patches.shape
-        patches = patches.view(patch_batch_idx * height * width, channels, patch_h, patch_w)
-
-        for level in range(1, pyramid_levels):
-            # create pyramid of patches - extract another sliding window of patch_dim * 2, pixel-wise,
-            # then interpolate down to patch_dim and stack with original patches, such that
-            # we get a tensor of shape [num_patches, channels, patch_dim, patch_dim]
-            # pad again with pad_size * 2
-            current_patch_dim *= 2
-            pad_size = current_patch_dim // 2
-            padded_pyramid = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
-            pyramid_patch = padded_pyramid.unfold(2, current_patch_dim, 1).unfold(3, current_patch_dim, 1)
+        print(f'\nEpoch {epoch+1}/{epochs}')
+        
+        for images in dataloader:
+            images = images.to(device)
+            
+            # Pad images for patch extraction
+            pad_size = patch_dim // 2
+            padded_images = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+            # Pad images with zeros
+            current_patch_dim = patch_dim
+            pad_size = patch_dim // 2
+            padded = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+            # Extract patch around each pixel using unfold with stride=1
+            # unfold gives us 513x513 patches from 520x520, but we only want 512x512
+            patches = padded.unfold(2, patch_dim, 1).unfold(3, patch_dim, 1)
             # Crop to keep only patches for the original 512x512 pixels
-            pyramid_patch = pyramid_patch[:, :, :512, :512, :, :]
-            # Shape after unfold: [batch, channels, 512, 512, patch_h, patch_w]
-            pyramid_patch = pyramid_patch.permute(0, 2, 3, 1, 4, 5).contiguous()
+            patches = patches[:, :, :512, :512, :, :]  # [batch, channels, 512, 512, patch_h, patch_w]
+            # Permute to get [batch, 512, 512, channels, patch_h, patch_w]
+            patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
             # Reshape to [batch*512*512, channels, patch_h, patch_w]
-            p_batch, p_height, p_width, p_channels, p_patch_h, p_patch_w = pyramid_patch.shape
-            pyramid_patch = pyramid_patch.view(p_batch * p_height * p_width, p_channels, p_patch_h, p_patch_w)
-            pyramid_patch = F.interpolate(pyramid_patch, size=(patch_dim, patch_dim))
-            # Concatenate with original patches along channel dimension, yielding [num_patches, channels + in_channels, patch_dim, patch_dim]
-            patches = torch.cat((patches, pyramid_patch), dim=1)
+            patch_batch_idx, height, width, channels, patch_h, patch_w = patches.shape
+            patches = patches.view(patch_batch_idx * height * width, channels, patch_h, patch_w)
 
-        print("Total patches shape with pyramid levels:", patches.shape)
-        print("Number of patches:", patches.shape[0])
-        print("Number of patch batches:", patches.shape[0] // patch_batch_size)
-        
-        # Static indices for intentional overfitting (no randomization)
-        indices = torch.randperm(patches.shape[0])
-        
-        for patch_batch_idx in range(patches.shape[0] // patch_batch_size):
-            # Use shuffled indices to grab random patches
-            batch_indices = indices[patch_batch_idx * patch_batch_size:(patch_batch_idx + 1) * patch_batch_size]
-            patch_batch = patches[batch_indices] # grab random per-pixel pyramid-patches
+            for level in range(1, pyramid_levels):
+                # create pyramid of patches - extract another sliding window of patch_dim * 2, pixel-wise,
+                # then interpolate down to patch_dim and stack with original patches, such that
+                # we get a tensor of shape [num_patches, channels, patch_dim, patch_dim]
+                # pad again with pad_size * 2
+                current_patch_dim *= 2
+                pad_size = current_patch_dim // 2
+                padded_pyramid = F.pad(images, (pad_size, pad_size, pad_size, pad_size), mode='constant', value=0)
+                pyramid_patch = padded_pyramid.unfold(2, current_patch_dim, 1).unfold(3, current_patch_dim, 1)
+                # Crop to keep only patches for the original 512x512 pixels
+                pyramid_patch = pyramid_patch[:, :, :512, :512, :, :]
+                # Shape after unfold: [batch, channels, 512, 512, patch_h, patch_w]
+                pyramid_patch = pyramid_patch.permute(0, 2, 3, 1, 4, 5).contiguous()
+                # Reshape to [batch*512*512, channels, patch_h, patch_w]
+                p_batch, p_height, p_width, p_channels, p_patch_h, p_patch_w = pyramid_patch.shape
+                pyramid_patch = pyramid_patch.view(p_batch * p_height * p_width, p_channels, p_patch_h, p_patch_w)
+                pyramid_patch = F.interpolate(pyramid_patch, size=(patch_dim, patch_dim))
+                # Concatenate with original patches along channel dimension, yielding [num_patches, channels + in_channels, patch_dim, patch_dim]
+                patches = torch.cat((patches, pyramid_patch), dim=1)
             
-            # Get model outputs and KL divergence
-            # model is fed entire image, batch_indices will be the entirety of its pixel indices in inference.
-            # currently we clip to only the pixel indices for patches we want to train on.
-            outputs, kl_div = model(images, batch_indices)
+            # Static indices for intentional overfitting (no randomization)
+            indices = torch.randperm(patches.shape[0])
             
-            optimizer.zero_grad()
-
-            # Total loss = reconstruction loss + KL divergence
-            recon_loss = criterion(outputs, patch_batch)
-
-            kl_weight = 0.0001
-            loss = recon_loss + kl_weight * kl_div
-            loss.backward()
-            optimizer.step()
-            print(f'Patch-Batch {patch_batch_idx}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_div.item():.4f}')
-
-            # debug visualize the patch batch inputs and outputs
-            if (patch_batch_idx+1) % 100 == 0:
-                all_comparisons = []
+            for patch_batch_idx in range(patches.shape[0] // patch_batch_size):
+                # Use shuffled indices to grab random patches
+                batch_indices = indices[patch_batch_idx * patch_batch_size:(patch_batch_idx + 1) * patch_batch_size]
+                patch_batch = patches[batch_indices] # grab random per-pixel pyramid-patches
                 
-                for i in range(patch_batch_size):
-                    input_patch = patch_batch[i].detach().cpu()
-                    output_patch = outputs[i].detach().cpu()
-                    
-                    # Create a 2-column layout: inputs on left, outputs on right
-                    # Stack pyramid levels vertically
-                    input_levels = []
-                    output_levels = []
-                    
-                    for l in range(pyramid_levels):
-                        # Visualize each level of the pyramid
-                        start_channel = l * 3
-                        end_channel = start_channel + 3
-                        input_level = input_patch[start_channel:end_channel, :, :]
-                        output_level = output_patch[start_channel:end_channel, :, :]
-                        input_levels.append(input_level)
-                        output_levels.append(output_level)
-                    
-                    # Stack levels vertically (along height dimension)
-                    input_column = torch.cat(input_levels, dim=1)
-                    output_column = torch.cat(output_levels, dim=1)
-                    
-                    # Concatenate horizontally to create 2-column layout
-                    comparison = torch.cat([input_column, output_column], dim=2)
-                    all_comparisons.append(comparison)
+                # Get model outputs and KL divergence
+                # model is fed entire image, batch_indices will be the entirety of its pixel indices in inference.
+                # currently we clip to only the pixel indices for patches we want to train on.
+                outputs, kl_div = model(images, batch_indices)
                 
-                # Stack all patch comparisons vertically into one large image
-                final_image = torch.cat(all_comparisons, dim=1)
-                
-                # Save the combined image
-                transforms.ToPILImage()(final_image).save(f'debug/batch_{patch_batch_idx}_all_patches.png')
+                optimizer.zero_grad()
 
-        print('Patches shape:', patches.shape)
+                # Total loss = reconstruction loss + KL divergence
+                recon_loss = criterion(outputs, patch_batch)
+
+                loss = recon_loss + kl_weight * kl_div
+                loss.backward()
+                optimizer.step()
+                
+                # Accumulate loss for epoch statistics
+                epoch_loss += loss.item()
+                epoch_recon_loss += recon_loss.item()
+                epoch_kl_loss += kl_div.item()
+                num_batches += 1
+                
+                # Print dot for batch progress
+                print('.', end='', flush=True)
+
+                # debug visualize the patch batch inputs and outputs
+                if (patch_batch_idx+1) % 100 == 0:
+                    all_comparisons = []
+                    
+                    for i in range(patch_batch_size):
+                        input_patch = patch_batch[i].detach().cpu()
+                        output_patch = outputs[i].detach().cpu()
+                        
+                        # Create a 2-column layout: inputs on left, outputs on right
+                        # Stack pyramid levels vertically
+                        input_levels = []
+                        output_levels = []
+                        
+                        for l in range(pyramid_levels):
+                            # Visualize each level of the pyramid
+                            start_channel = l * 3
+                            end_channel = start_channel + 3
+                            input_level = input_patch[start_channel:end_channel, :, :]
+                            output_level = output_patch[start_channel:end_channel, :, :]
+                            input_levels.append(input_level)
+                            output_levels.append(output_level)
+                        
+                        # Stack levels vertically (along height dimension)
+                        input_column = torch.cat(input_levels, dim=1)
+                        output_column = torch.cat(output_levels, dim=1)
+                        
+                        # Concatenate horizontally to create 2-column layout
+                        comparison = torch.cat([input_column, output_column], dim=2)
+                        all_comparisons.append(comparison)
+                    
+                    # Stack all patch comparisons vertically into one large image
+                    final_image = torch.cat(all_comparisons, dim=1)
+                    
+                    # Save the combined image
+                    transforms.ToPILImage()(final_image).save(f'debug/epoch_{epoch}_batch_{patch_batch_idx}_all_patches.png')
+        
+        # Print epoch statistics
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        avg_recon_loss = epoch_recon_loss / num_batches if num_batches > 0 else 0
+        avg_kl_loss = epoch_kl_loss / num_batches if num_batches > 0 else 0
+        print(f'\nEpoch {epoch+1} completed - Total Loss: {avg_epoch_loss:.4f}, Recon: {avg_recon_loss:.4f}, KL: {avg_kl_loss:.4f}')
