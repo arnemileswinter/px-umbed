@@ -17,6 +17,8 @@ This approach creates a dense per-pixel embedding space where each location is r
 
 The visualization below shows input patches (left) alongside their reconstructions (right) at multiple pyramid levels:
 
+**OOPS. THE GOOD VISUALIZATIONS ARE ACTUALLY CAUSE DURING TRAINING I HAD THE KL TERM ESSENTIALLY TURNED OFF... GRAIN OF SALT!**
+
 ![Sample Output](docs/sample_output.png)
 
 ## Features
